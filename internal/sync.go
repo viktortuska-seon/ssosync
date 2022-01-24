@@ -45,6 +45,22 @@ type syncGSuite struct {
 	users map[string]*aws.User
 }
 
+// Run will call f function if s.cfg.DryRun is false
+func (s *syncGSuite) Run(logger *log.Entry, logMsg string, f func() error) error {
+	if s.cfg.DryRun {
+		logger.Info(fmt.Sprintf("Dry Run: %s", logMsg))
+		return nil
+	}
+
+	err := f()
+	if err != nil {
+		logger.Error(logMsg)
+	} else {
+		logger.Info(logMsg)
+	}
+	return err
+}
+
 // New will create a new SyncGSuite object
 func New(cfg *config.Config, a aws.Client, g google.Client) SyncGSuite {
 	return &syncGSuite{
@@ -94,10 +110,12 @@ func (s *syncGSuite) SyncUsers(query string) error {
 			continue
 		}
 
-		if err := s.aws.DeleteUser(uu); err != nil {
-			log.WithFields(log.Fields{
-				"email": u.PrimaryEmail,
-			}).Warn("Error deleting user")
+		logEntry := log.WithField("email", u.PrimaryEmail)
+		err = s.Run(logEntry, "deleting google user", func() (e error) {
+			e = s.aws.DeleteUser(uu)
+			return e
+		})
+		if err != nil {
 			return err
 		}
 	}
@@ -123,14 +141,15 @@ func (s *syncGSuite) SyncUsers(query string) error {
 			s.users[uu.Username] = uu
 			// Update the user when suspended state is changed
 			if uu.Active == u.Suspended {
-				log.Debug("Mismatch active/suspended, updating user")
-				// create new user object and update the user
-				_, err := s.aws.UpdateUser(aws.UpdateUser(
-					uu.ID,
-					u.Name.GivenName,
-					u.Name.FamilyName,
-					u.PrimaryEmail,
-					!u.Suspended))
+				err = s.Run(ll, "Mismatch active/suspended, updating AWS user", func() (e error) {
+					_, e = s.aws.UpdateUser(aws.UpdateUser(
+						uu.ID,
+						u.Name.GivenName,
+						u.Name.FamilyName,
+						u.PrimaryEmail,
+						!u.Suspended))
+					return e
+				})
 				if err != nil {
 					return err
 				}
@@ -139,16 +158,22 @@ func (s *syncGSuite) SyncUsers(query string) error {
 		}
 
 		ll.Info("creating user")
-		uu, err := s.aws.CreateUser(aws.NewUser(
+		newAWSUser := aws.NewUser(
 			u.Name.GivenName,
 			u.Name.FamilyName,
 			u.PrimaryEmail,
-			!u.Suspended))
+			!u.Suspended)
+		err = s.Run(ll, "creating user", func() (e error) {
+			uu, e := s.aws.CreateUser(newAWSUser)
+			if e == nil {
+				newAWSUser = uu
+			}
+			return e
+		})
 		if err != nil {
 			return err
 		}
-
-		s.users[uu.Username] = uu
+		s.users[newAWSUser.Username] = newAWSUser
 	}
 
 	return nil
@@ -197,13 +222,19 @@ func (s *syncGSuite) SyncGroups(query string) error {
 			correlatedGroups[gg.DisplayName] = gg
 			group = gg
 		} else {
-			log.Info("Creating group in AWS")
-			newGroup, err := s.aws.CreateGroup(aws.NewGroup(g.Email))
+			newAWSGroup := aws.NewGroup(g.Email)
+			err := s.Run(log, "creating group", func() (e error) {
+				newGroup, e := s.aws.CreateGroup(newAWSGroup)
+				if e == nil {
+					newAWSGroup = newGroup
+				}
+				return e
+			})
 			if err != nil {
 				return err
 			}
-			correlatedGroups[newGroup.DisplayName] = newGroup
-			group = newGroup
+			correlatedGroups[newAWSGroup.DisplayName] = newAWSGroup
+			group = newAWSGroup
 		}
 
 		groupMembers, err := s.google.GetGroupMembers(g)
@@ -228,18 +259,23 @@ func (s *syncGSuite) SyncGroups(query string) error {
 				return err
 			}
 
+			logEntry := log.WithField("user", u.Username)
 			if _, ok := memberList[u.Username]; ok {
 				if !b {
-					log.WithField("user", u.Username).Info("Adding user to group")
-					err := s.aws.AddUserToGroup(u, group)
+					err := s.Run(logEntry, fmt.Sprintf("Adding user to group %s", group.DisplayName), func() (e error) {
+						e = s.aws.AddUserToGroup(u, group)
+						return e
+					})
 					if err != nil {
 						return err
 					}
 				}
 			} else {
 				if b {
-					log.WithField("user", u.Username).Warn("Removing user from group")
-					err := s.aws.RemoveUserFromGroup(u, group)
+					err := s.Run(logEntry, fmt.Sprintf("Removing user from group %s", group.DisplayName), func() (e error) {
+						e = s.aws.RemoveUserFromGroup(u, group)
+						return e
+					})
 					if err != nil {
 						return err
 					}
@@ -329,9 +365,11 @@ func (s *syncGSuite) SyncGroupsUsers(query string) error {
 			return err
 		}
 
-		log.Warn("deleting user")
-		if err := s.aws.DeleteUser(awsUserFull); err != nil {
-			log.Error("error deleting user")
+		err = s.Run(log, "deleting user", func() (e error) {
+			e = s.aws.DeleteUser(awsUserFull)
+			return e
+		})
+		if err != nil {
 			return err
 		}
 	}
@@ -350,10 +388,11 @@ func (s *syncGSuite) SyncGroupsUsers(query string) error {
 
 		awsUser.ID = awsUserFull.ID
 
-		log.Warn("updating user")
-		_, err = s.aws.UpdateUser(awsUser)
+		err = s.Run(log, "udpating user", func() (e error) {
+			_, e = s.aws.UpdateUser(awsUser)
+			return e
+		})
 		if err != nil {
-			log.Error("error updating user")
 			return err
 		}
 	}
@@ -364,10 +403,11 @@ func (s *syncGSuite) SyncGroupsUsers(query string) error {
 
 		log := log.WithFields(log.Fields{"user": awsUser.Username})
 
-		log.Info("creating user")
-		_, err := s.aws.CreateUser(awsUser)
+		err := s.Run(log, "creating user", func() (e error) {
+			_, e = s.aws.CreateUser(awsUser)
+			return e
+		})
 		if err != nil {
-			log.Error("error creating user")
 			return err
 		}
 	}
@@ -378,10 +418,11 @@ func (s *syncGSuite) SyncGroupsUsers(query string) error {
 
 		log := log.WithFields(log.Fields{"group": awsGroup.DisplayName})
 
-		log.Info("creating group")
-		awsGroup, err := s.aws.CreateGroup(awsGroup)
+		err := s.Run(log, "creating group", func() (e error) {
+			awsGroup, e = s.aws.CreateGroup(awsGroup)
+			return e
+		})
 		if err != nil {
-			log.Error("creating group")
 			return err
 		}
 
@@ -389,14 +430,17 @@ func (s *syncGSuite) SyncGroupsUsers(query string) error {
 		for _, googleUser := range googleGroupsUsers[awsGroup.DisplayName] {
 
 			// equivalent aws user of google user on the fly
-			log.Debug("finding user")
-			awsUserFull, err := s.aws.FindUserByEmail(googleUser.PrimaryEmail)
-			if err != nil {
-				return err
-			}
+			logEntry := log.WithField("user", googleUser.PrimaryEmail)
+			err := s.Run(logEntry, "finding user and adding to group", func() (e error) {
+				awsUserFull, e := s.aws.FindUserByEmail(googleUser.PrimaryEmail)
+				if e != nil {
+					return e
+				}
 
-			log.WithField("user", awsUserFull.Username).Info("adding user to group")
-			err = s.aws.AddUserToGroup(awsUserFull, awsGroup)
+				log.WithField("user", googleUser.PrimaryEmail).Info("adding user to group")
+				e = s.aws.AddUserToGroup(awsUserFull, awsGroup)
+				return e
+			})
 			if err != nil {
 				return err
 			}
@@ -421,15 +465,18 @@ func (s *syncGSuite) SyncGroupsUsers(query string) error {
 				return err
 			}
 
-			log.WithField("user", awsUserFull.Username).Debug("checking user is in group already")
+			logEntry := log.WithField("user", awsUserFull.Username)
+			logEntry.Debug("checking user is in group already")
 			b, err := s.aws.IsUserInGroup(awsUserFull, awsGroup)
 			if err != nil {
 				return err
 			}
 
 			if !b {
-				log.WithField("user", awsUserFull.Username).Info("adding user to group")
-				err := s.aws.AddUserToGroup(awsUserFull, awsGroup)
+				err := s.Run(logEntry, "adding user to group", func() (e error) {
+					e = s.aws.AddUserToGroup(awsUserFull, awsGroup)
+					return e
+				})
 				if err != nil {
 					return err
 				}
@@ -437,8 +484,11 @@ func (s *syncGSuite) SyncGroupsUsers(query string) error {
 		}
 
 		for _, awsUser := range deleteUsersFromGroup[awsGroup.DisplayName] {
-			log.WithField("user", awsUser.Username).Warn("removing user from group")
-			err := s.aws.RemoveUserFromGroup(awsUser, awsGroup)
+			logEntry := log.WithField("user", awsUser.Username)
+			err := s.Run(logEntry, "removing user from group", func() (e error) {
+				e = s.aws.RemoveUserFromGroup(awsUser, awsGroup)
+				return e
+			})
 			if err != nil {
 				return err
 			}
@@ -457,15 +507,14 @@ func (s *syncGSuite) SyncGroupsUsers(query string) error {
 			return err
 		}
 
-		log.Warn("deleting group")
-		err = s.aws.DeleteGroup(awsGroupFull)
+		err = s.Run(log, "deleting group", func() (e error) {
+			e = s.aws.DeleteGroup(awsGroupFull)
+			return e
+		})
 		if err != nil {
-			log.Error("deleting group")
 			return err
 		}
 	}
-
-	log.Info("sync completed")
 
 	return nil
 }
