@@ -348,8 +348,10 @@ func (s *syncGSuite) SyncGroupsUsers(query string) error {
 			return err
 		}
 
+		awsUser.ID = awsUserFull.ID
+
 		log.Warn("updating user")
-		_, err = s.aws.UpdateUser(awsUserFull)
+		_, err = s.aws.UpdateUser(awsUser)
 		if err != nil {
 			log.Error("error updating user")
 			return err
