@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
+	"time"
 
 	"github.com/awslabs/ssosync/internal/aws"
 	"github.com/awslabs/ssosync/internal/config"
@@ -43,6 +44,36 @@ type syncGSuite struct {
 	cfg    *config.Config
 
 	users map[string]*aws.User
+}
+
+// Retry function
+func (s *syncGSuite) Retry(logger *log.Entry, f func() error) error {
+	var backoffSchedule = []time.Duration{
+		1 * time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+	}
+
+	for backoffIdx, tries := 0, 1; ; backoffIdx, tries = backoffIdx+1, tries+1 {
+		err := f()
+		if err == nil {
+			return nil
+		}
+
+		logger.Info(fmt.Sprintf("Request error: %+v\n", err))
+		logger.Info(fmt.Sprintf("Retrying in %v\n", backoffSchedule[backoffIdx]))
+		time.Sleep(backoffSchedule[backoffIdx])
+
+		if backoffIdx == len(backoffSchedule)-1 {
+			backoffIdx = -1
+		}
+		if tries == s.cfg.MaxRetries {
+			return fmt.Errorf("Retry failed")
+		}
+	}
+
+	return nil
 }
 
 // Run will call f function if s.cfg.DryRun is false
@@ -112,8 +143,10 @@ func (s *syncGSuite) SyncUsers(query string) error {
 
 		logEntry := log.WithField("email", u.PrimaryEmail)
 		err = s.Run(logEntry, "deleting google user", func() (e error) {
-			e = s.aws.DeleteUser(uu)
-			return e
+			return s.Retry(logEntry, func() (e error) {
+				e = s.aws.DeleteUser(uu)
+				return e
+			})
 		})
 		if err != nil {
 			return err
@@ -142,13 +175,15 @@ func (s *syncGSuite) SyncUsers(query string) error {
 			// Update the user when suspended state is changed
 			if uu.Active == u.Suspended {
 				err = s.Run(ll, "Mismatch active/suspended, updating AWS user", func() (e error) {
-					_, e = s.aws.UpdateUser(aws.UpdateUser(
-						uu.ID,
-						u.Name.GivenName,
-						u.Name.FamilyName,
-						u.PrimaryEmail,
-						!u.Suspended))
-					return e
+					return s.Retry(ll, func() (e error) {
+						_, e = s.aws.UpdateUser(aws.UpdateUser(
+							uu.ID,
+							u.Name.GivenName,
+							u.Name.FamilyName,
+							u.PrimaryEmail,
+							!u.Suspended))
+						return e
+					})
 				})
 				if err != nil {
 					return err
@@ -164,11 +199,13 @@ func (s *syncGSuite) SyncUsers(query string) error {
 			u.PrimaryEmail,
 			!u.Suspended)
 		err = s.Run(ll, "creating user", func() (e error) {
-			uu, e := s.aws.CreateUser(newAWSUser)
-			if e == nil {
-				newAWSUser = uu
-			}
-			return e
+			return s.Retry(ll, func() (e error) {
+				uu, e := s.aws.CreateUser(newAWSUser)
+				if e == nil {
+					newAWSUser = uu
+				}
+				return e
+			})
 		})
 		if err != nil {
 			return err
@@ -224,11 +261,13 @@ func (s *syncGSuite) SyncGroups(query string) error {
 		} else {
 			newAWSGroup := aws.NewGroup(g.Email)
 			err := s.Run(log, "creating group", func() (e error) {
-				newGroup, e := s.aws.CreateGroup(newAWSGroup)
-				if e == nil {
-					newAWSGroup = newGroup
-				}
-				return e
+				return s.Retry(log, func() (e error) {
+					newGroup, e := s.aws.CreateGroup(newAWSGroup)
+					if e == nil {
+						newAWSGroup = newGroup
+					}
+					return e
+				})
 			})
 			if err != nil {
 				return err
@@ -263,8 +302,10 @@ func (s *syncGSuite) SyncGroups(query string) error {
 			if _, ok := memberList[u.Username]; ok {
 				if !b {
 					err := s.Run(logEntry, fmt.Sprintf("Adding user to group %s", group.DisplayName), func() (e error) {
-						e = s.aws.AddUserToGroup(u, group)
-						return e
+						return s.Retry(logEntry, func() (e error) {
+							e = s.aws.AddUserToGroup(u, group)
+							return e
+						})
 					})
 					if err != nil {
 						return err
@@ -273,8 +314,10 @@ func (s *syncGSuite) SyncGroups(query string) error {
 			} else {
 				if b {
 					err := s.Run(logEntry, fmt.Sprintf("Removing user from group %s", group.DisplayName), func() (e error) {
-						e = s.aws.RemoveUserFromGroup(u, group)
-						return e
+						return s.Retry(logEntry, func() (e error) {
+							e = s.aws.RemoveUserFromGroup(u, group)
+							return e
+						})
 					})
 					if err != nil {
 						return err
@@ -366,8 +409,10 @@ func (s *syncGSuite) SyncGroupsUsers(query string) error {
 		}
 
 		err = s.Run(log, "deleting user", func() (e error) {
-			e = s.aws.DeleteUser(awsUserFull)
-			return e
+			return s.Retry(log, func() (e error) {
+				e = s.aws.DeleteUser(awsUserFull)
+				return e
+			})
 		})
 		if err != nil {
 			return err
@@ -389,8 +434,10 @@ func (s *syncGSuite) SyncGroupsUsers(query string) error {
 		awsUser.ID = awsUserFull.ID
 
 		err = s.Run(log, "udpating user", func() (e error) {
-			_, e = s.aws.UpdateUser(awsUser)
-			return e
+			return s.Retry(log, func() (e error) {
+				_, e = s.aws.UpdateUser(awsUser)
+				return e
+			})
 		})
 		if err != nil {
 			return err
@@ -404,8 +451,10 @@ func (s *syncGSuite) SyncGroupsUsers(query string) error {
 		log := log.WithFields(log.Fields{"user": awsUser.Username})
 
 		err := s.Run(log, "creating user", func() (e error) {
-			_, e = s.aws.CreateUser(awsUser)
-			return e
+			return s.Retry(log, func() (e error) {
+				_, e = s.aws.CreateUser(awsUser)
+				return e
+			})
 		})
 		if err != nil {
 			return err
@@ -419,8 +468,10 @@ func (s *syncGSuite) SyncGroupsUsers(query string) error {
 		log := log.WithFields(log.Fields{"group": awsGroup.DisplayName})
 
 		err := s.Run(log, "creating group", func() (e error) {
-			awsGroup, e = s.aws.CreateGroup(awsGroup)
-			return e
+			return s.Retry(log, func() (e error) {
+				awsGroup, e = s.aws.CreateGroup(awsGroup)
+				return e
+			})
 		})
 		if err != nil {
 			return err
@@ -432,14 +483,16 @@ func (s *syncGSuite) SyncGroupsUsers(query string) error {
 			// equivalent aws user of google user on the fly
 			logEntry := log.WithField("user", googleUser.PrimaryEmail)
 			err := s.Run(logEntry, "finding user and adding to group", func() (e error) {
-				awsUserFull, e := s.aws.FindUserByEmail(googleUser.PrimaryEmail)
-				if e != nil {
-					return e
-				}
+				return s.Retry(logEntry, func() (e error) {
+					awsUserFull, e := s.aws.FindUserByEmail(googleUser.PrimaryEmail)
+					if e != nil {
+						return e
+					}
 
-				log.WithField("user", googleUser.PrimaryEmail).Info("adding user to group")
-				e = s.aws.AddUserToGroup(awsUserFull, awsGroup)
-				return e
+					log.WithField("user", googleUser.PrimaryEmail).Info("adding user to group")
+					e = s.aws.AddUserToGroup(awsUserFull, awsGroup)
+					return e
+				})
 			})
 			if err != nil {
 				return err
@@ -474,8 +527,10 @@ func (s *syncGSuite) SyncGroupsUsers(query string) error {
 
 			if !b {
 				err := s.Run(logEntry, "adding user to group", func() (e error) {
-					e = s.aws.AddUserToGroup(awsUserFull, awsGroup)
-					return e
+					return s.Retry(logEntry, func() (e error) {
+						e = s.aws.AddUserToGroup(awsUserFull, awsGroup)
+						return e
+					})
 				})
 				if err != nil {
 					return err
@@ -486,8 +541,10 @@ func (s *syncGSuite) SyncGroupsUsers(query string) error {
 		for _, awsUser := range deleteUsersFromGroup[awsGroup.DisplayName] {
 			logEntry := log.WithField("user", awsUser.Username)
 			err := s.Run(logEntry, "removing user from group", func() (e error) {
-				e = s.aws.RemoveUserFromGroup(awsUser, awsGroup)
-				return e
+				return s.Retry(logEntry, func() (e error) {
+					e = s.aws.RemoveUserFromGroup(awsUser, awsGroup)
+					return e
+				})
 			})
 			if err != nil {
 				return err
@@ -508,8 +565,10 @@ func (s *syncGSuite) SyncGroupsUsers(query string) error {
 		}
 
 		err = s.Run(log, "deleting group", func() (e error) {
-			e = s.aws.DeleteGroup(awsGroupFull)
-			return e
+			return s.Retry(log, func() (e error) {
+				e = s.aws.DeleteGroup(awsGroupFull)
+				return e
+			})
 		})
 		if err != nil {
 			return err
